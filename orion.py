@@ -11,24 +11,33 @@ import webbrowser
 import re
 import subprocess
 import pygame
+import psutil
+import logging
+import queue
 
 # === CONFIG ===
-API_KEY = "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"
-MODEL = "mistralai/mistral-7b-instruct:free"
+SERP_API_KEY = "e72745ef9cd7230496a575fe5facd19a4cc7b77e476cd7a97395abf915d5cb22"
+MODEL = "serpapi"
 HEADERS = {
-    "Authorization": f"Bearer {API_KEY}",
     "Content-Type": "application/json"
 }
 
-# === FLAGS ===
+# === FLAGS & QUEUES ===
 muted = False
 speaking = False
 stop_speaking = False
 interrupt_command = None
+wake_word_active = True
+wake_word_queue = queue.Queue()
 memory_file = "orion_memory.json"
 
-# === INIT PYGAME ===
+# === INIT ===
 pygame.mixer.init()
+logging.basicConfig(filename="orion.log", level=logging.INFO)
+
+# === MICROPHONES ===
+main_mic = sr.Microphone(device_index=None, sample_rate=16000)
+wake_mic = sr.Microphone(device_index=None, sample_rate=8000)
 
 # === MEMORY ===
 def load_memory():
@@ -42,34 +51,38 @@ def save_memory(mem):
         json.dump(mem, f, indent=2)
 
 conversation_memory = load_memory()
-interrupt_recognizer = sr.Recognizer()
 
-# === INTERRUPT LISTENER ===
-def interrupt_listener():
-    global stop_speaking, interrupt_command
-    try:
-        with sr.Microphone() as source:
-            interrupt_recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            audio = interrupt_recognizer.listen(source, timeout=3, phrase_time_limit=3)
-            command = interrupt_recognizer.recognize_google(audio).lower()
-            if command:
-                print(f"🚩 Interrupt: {command}")
-                stop_speaking = True
-                interrupt_command = command
-                pygame.mixer.music.stop()
-    except:
-        pass
+# === CONTINUOUS WAKE WORD LISTENER ===
+def continuous_wake_word_listener():
+    global wake_word_active, stop_speaking
+    wake_recognizer = sr.Recognizer()
+    wake_recognizer.energy_threshold = 4000
+
+    while wake_word_active:
+        try:
+            with wake_mic as source:
+                audio = wake_recognizer.listen(source, timeout=1, phrase_time_limit=2)
+                text = wake_recognizer.recognize_google(audio).lower()
+                if "hey orion" in text or "ok orion" in text:
+                    wake_word_queue.put("WAKE_WORD_DETECTED")
+                    print("🔥 Wake word detected!")
+                    if speaking:
+                        stop_speaking = True
+        except (sr.WaitTimeoutError, sr.UnknownValueError):
+            continue
+        except Exception:
+            time.sleep(0.1)
 
 # === TEXT CLEANER ===
 def clean_text(text):
-    return re.sub(r'[:;=8][-^]?[)D]', '', re.sub(r'[🙂😀😊😂😉😎😍😭😢😅😆🤔🤯💬✨❤️💯🚀👏👀👍🙏]', '', text))
+    return re.sub(r'[:;=8][-^]?[)D]', '', re.sub(r'[\U0001F600-\U0001F64F]+', '', text))
 
 # === SPEAK FUNCTION ===
 def speak(text):
     global muted, speaking, stop_speaking
     speaking = True
     stop_speaking = False
-    print(f"{'(Muted) ' if muted else ''}ORION: {text}")
+    print(f"{('(Muted) ' if muted else '')}ORION: {text}")
     if not muted:
         try:
             text = clean_text(text)
@@ -77,38 +90,38 @@ def speak(text):
             filename = f"voice_{random.randint(1000,9999)}.mp3"
             tts.save(filename)
 
-            interrupt_thread = threading.Thread(target=interrupt_listener)
-            interrupt_thread.start()
-
             pygame.mixer.music.load(filename)
             pygame.mixer.music.play()
 
             while pygame.mixer.music.get_busy():
-                if stop_speaking:
-                    print("🔇 Speech interrupted by user.")
+                try:
+                    wake_word_queue.get_nowait()
+                    print("🔇 Interrupted by Wake Word!")
                     pygame.mixer.music.stop()
+                    stop_speaking = True
+                    break
+                except queue.Empty:
+                    pass
+
+                if stop_speaking:
                     break
                 time.sleep(0.1)
 
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.1)
-
             pygame.mixer.music.unload()
-            time.sleep(0.2)
             os.remove(filename)
 
         except Exception as e:
             print(f"Audio Error: {e}")
     speaking = False
 
-# === LISTEN ===
+# === LISTEN FUNCTION ===
 def listen():
     global speaking
     while speaking:
         time.sleep(0.5)
 
     recognizer = sr.Recognizer()
-    with sr.Microphone() as source:
+    with main_mic as source:
         print("🎤 Listening...")
         recognizer.adjust_for_ambient_noise(source, duration=0.5)
         try:
@@ -119,9 +132,9 @@ def listen():
 
     try:
         print("🤠 Recognizing...")
-        command = recognizer.recognize_google(audio)
+        command = recognizer.recognize_google(audio).lower()
         print(f"🗣️ You said: {command}")
-        return command.lower()
+        return command
     except sr.UnknownValueError:
         print("❌ Could not understand audio")
         speak("Sorry, I didn't catch that.")
@@ -131,17 +144,19 @@ def listen():
         speak("Speech recognition service is unavailable.")
         return None
 
-# === WEATHER / TIME / APP ===
-def get_live_news():
+# === SYSTEM FEATURES ===
+def get_battery_status():
     try:
-        url = "https://newsapi.org/v2/top-headlines?country=in&apiKey=your_news_api_key"
-        response = requests.get(url)
-        articles = response.json().get("articles", [])[:3]
-        headlines = [article["title"] for article in articles]
-        return "Here are the latest headlines: " + ". ".join(headlines) if headlines else "No news available."
-    except:
-        return "Sorry, couldn't fetch news."
+        battery = psutil.sensors_battery()
+        if battery:
+            return f"The battery is at {battery.percent}%."
+        else:
+            return "Battery information is not available."
+    except Exception as e:
+        print(f"Battery Error: {e}")
+        return "Could not fetch battery info."
 
+# === APP LAUNCHING ===
 def open_app_or_website(prompt):
     app_mappings = {
         "notepad": "notepad.exe",
@@ -168,7 +183,7 @@ def open_app_or_website(prompt):
         return f"Searching for {query}."
     return None
 
-# === CHAT ===
+# === ORION CHAT ===
 def chat_with_orion(prompt):
     global conversation_memory
     try:
@@ -176,44 +191,44 @@ def chat_with_orion(prompt):
             return datetime.now().strftime("The time is %I:%M %p.")
         if "date" in prompt:
             return datetime.now().strftime("Today is %A, %d %B %Y.")
+        if "battery" in prompt:
+            return get_battery_status()
 
         app_response = open_app_or_website(prompt)
         if app_response:
             return app_response
 
-        if "news" in prompt:
-            return get_live_news()
-
         speak(random.choice(["Let me think...", "Just a second...", "Working on it..."]))
 
-        conversation_memory.append({"role": "user", "content": prompt})
-        payload = {
-            "model": MODEL,
-            "messages": [{"role": "system", "content": "You are ORION, a friendly voice assistant."}] + conversation_memory[-10:]
-        }
+        # Use SerpAPI for search-based response
+        query = prompt.replace(" ", "+")
+        serp_url = f"https://serpapi.com/search.json?q={query}&api_key={SERP_API_KEY}"
+        response = requests.get(serp_url)
+        response.raise_for_status()
+        results = response.json()
 
-        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=HEADERS, json=payload)
-        res.raise_for_status()
-        reply = res.json()['choices'][0]['message']['content']
-        conversation_memory.append({"role": "assistant", "content": reply})
-        save_memory(conversation_memory)
-        return reply
+        if "answer_box" in results and "answer" in results["answer_box"]:
+            return results["answer_box"]["answer"]
+        elif "organic_results" in results and len(results["organic_results"]) > 0:
+            return results["organic_results"][0].get("snippet", "Here's what I found online.")
+        else:
+            return "Sorry, I couldn't find anything relevant."
+
     except Exception as e:
         print(f"❌ API Error: {e}")
         return "Sorry, I couldn't reach the server."
 
-# === HANDLE COMMAND ===
+# === COMMAND HANDLER ===
 def handle_command(command):
     global muted
-
-    if command is None:
+    if not command:
         return
 
-    if "stop" in command or "exit" in command or "goodbye" in command:
+    if any(x in command for x in ["stop", "exit", "goodbye", "cancel"]):
         speak("Goodbye! See you soon.")
         exit()
 
-    if "mute" in command or "stop talking" in command:
+    if "mute" in command:
         muted = True
         print("🔇 ORION is now muted.")
         return
@@ -234,16 +249,23 @@ def handle_command(command):
 
     speak(chat_with_orion(command))
 
-# === RUN ORION ===
+# === MAIN LOOP ===
 def run_orion():
-    global interrupt_command
+    global wake_word_active, stop_speaking
+
+    wake_word_active = True
+    threading.Thread(target=continuous_wake_word_listener, daemon=True).start()
+
     speak("Hello Saksham! I am ORION. How can I help you?")
+
     while True:
-        if interrupt_command:
-            command = interrupt_command
-            interrupt_command = None
-        else:
-            command = listen()
+        if not wake_word_queue.empty():
+            wake_word_queue.get()
+            if speaking:
+                stop_speaking = True
+                time.sleep(0.5)
+
+        command = listen()
         handle_command(command)
 
 if __name__ == "__main__":
